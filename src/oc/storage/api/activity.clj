@@ -105,7 +105,7 @@
         follow-data (when follow?
                       (follow-parameters-map user-id (:slug org) following))
         read-data (when user-id
-                    (read/retrieve-by-user-org config/dynamodb-opts (:uuid org) user-id))
+                    (read/retrieve-by-user-org config/dynamodb-opts user-id (:uuid org)))
         threads (entry-res/paginated-threads conn (:uuid org) allowed-boards user-id follow-data read-data order start direction config/default-activity-limit {})
         entries (entry-res/entries-list conn (:uuid org) (map :resource-uuid threads))
         total-count (entry-res/paginated-threads conn (:uuid org) allowed-boards user-id follow-data [] :asc (* (c/to-long (t/now)) 1000) :before 0 {:count true})
