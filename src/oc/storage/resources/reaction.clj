@@ -24,6 +24,10 @@
   that include the count of how many times reacted and the list of author names and IDs that reacted.
   "
   [entry-reactions]
-  (let [fixed-entry-reactions (conj (map #(assoc % :count 1) entry-reactions) {:reaction "👍" :count 0})
-        collapsed-reactions (vals (reduce reaction-collapse {} fixed-entry-reactions))]
-    (or collapsed-reactions [])))
+  (let [thumb-reaction "👍"
+        fixed-entry-reactions (concat [{:reaction thumb-reaction :count 0}] (map #(assoc % :count 1) entry-reactions))
+        collapsed-reactions (vals (reduce reaction-collapse {} fixed-entry-reactions))
+        check-fn #(= (:reaction %) thumb-reaction)
+        thumb-reactions (some #(when (check-fn %) %) collapsed-reactions)
+        rest-reactions (filter #(not (check-fn %)) collapsed-reactions)]
+    (or (concat [thumb-reactions] rest-reactions) [])))

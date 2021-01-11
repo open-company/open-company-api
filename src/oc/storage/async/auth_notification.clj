@@ -7,6 +7,7 @@
    [clojure.core.async :as async :refer (<!! >!!)]
    [cheshire.core :as json]
    [oc.lib.sqs :as sqs]
+   [oc.lib.sentry.core :as sentry]
    [oc.lib.db.pool :as pool]
    [oc.storage.resources.org :as org-res]
    [taoensso.timbre :as timbre]))
@@ -56,19 +57,22 @@
   "Start a core.async consumer of the auth notification channel."
   [db-pool]
   (reset! auth-notification-go true)
-  (async/go (while @auth-notification-go
+  (async/go
+    (while @auth-notification-go
       (timbre/info "Waiting for message on auth notification channel...")
       (let [msg (<!! auth-notification-chan)]
         (timbre/trace "Processing message on auth notification channel...")
         (if (:stop msg)
           (do (reset! auth-notification-go false) (timbre/info "Auth notification stopped."))
-          (try
-            (when (:Message msg) ;; data change SNS message
-              (let [msg-parsed (json/parse-string (:Message msg) true)]
-                (new-user-event db-pool msg-parsed)))
-            (timbre/trace "Processing complete.")
-            (catch Exception e
-              (timbre/error e))))))))
+          (async/thread
+            (try
+              (when (:Message msg) ;; data change SNS message
+                (let [msg-parsed (json/parse-string (:Message msg) true)]
+                  (new-user-event db-pool msg-parsed)))
+              (timbre/trace "Processing complete.")
+              (catch Exception e
+                (timbre/warn e)
+                (sentry/capture e)))))))))
 
 ;; ----- Component start/stop -----
 

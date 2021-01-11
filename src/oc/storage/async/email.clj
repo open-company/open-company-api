@@ -23,7 +23,6 @@
    :board-name (schema/maybe schema/Str)
    :board-access (schema/maybe schema/Str)
    :headline schema/Str
-   :abstract (schema/maybe schema/Str)
    :body (schema/maybe schema/Str)
    :must-see (schema/maybe schema/Bool)
    :video-id (schema/maybe schema/Str)
@@ -50,7 +49,6 @@
    :board-name (:name board)
    :board-access (:access board)
    :headline (:headline entry)
-   :abstract (:abstract entry)
    :body (:body entry)
    :must-see (:must-see entry)
    :video-id (:video-id entry)

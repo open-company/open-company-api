@@ -4,6 +4,7 @@
             [org.httpkit.server :as httpkit]
             [oc.lib.db.pool :as pool]
             [oc.lib.sqs :as sqs]
+            [oc.lib.sentry.core :refer (map->SentryCapturer)]
             [oc.storage.async.notification :as notification]
             [oc.storage.async.auth-notification :as auth-notif]
             [oc.storage.async.storage-notification :as storage-notif]
@@ -25,7 +26,7 @@
         (timbre/info "[http] stopping...")
         (http-kit)
         (timbre/info "[http] stopped")
-        (dissoc component :http-kit))
+        (assoc component :http-kit nil))
       component)))
 
 (defrecord RethinkPool [size regenerate-interval pool]
@@ -44,7 +45,7 @@
         (timbre/info "[rethinkdb-pool] stopping...")
         (pool/shutdown-pool! pool)
         (timbre/info "[rethinkdb-pool] stopped")
-        (dissoc component :pool))
+        (assoc component :pool nil))
       component)))
 
 (defrecord AsyncConsumers []
@@ -62,7 +63,7 @@
         (timbre/info "[async-consumers] stopping")
         (notification/stop) ; core.async channel consumer for notification events
         (timbre/info "[async-consumers] stopped")
-        (dissoc component :async-consumers))
+        (assoc component :async-consumers nil))
     component)))
 
 (defrecord Handler [handler-fn]
@@ -72,7 +73,7 @@
     (assoc component :handler (handler-fn component)))
   (stop [component]
     (timbre/info "[handler] stopped")
-    (dissoc component :handler)))
+    (assoc component :handler nil)))
 
 (defrecord AuthNotification [auth-notification-fn]
   component/Lifecycle
@@ -89,7 +90,7 @@
         (timbre/info "[auth-notification] stopping...")
         (auth-notif/stop)
         (timbre/info "[auth-notification] stopped")
-        (dissoc component :auth-notification))
+        (assoc component :auth-notification nil))
       component)))
 
 (defrecord StorageNotification [storage-notification-fn]
@@ -107,7 +108,7 @@
         (timbre/info "[storage-notification] stopping...")
         (storage-notif/stop)
         (timbre/info "[storage-notification] stopped")
-        (dissoc component :storage-notification))
+        (assoc component :storage-notification nil))
       component)))
 
 (defn db-only-storage-system [_opts]
@@ -115,12 +116,15 @@
    :db-pool (map->RethinkPool {:size c/db-pool-size :regenerate-interval 5})))
 
 (defn storage-system [{:keys [host port handler-fn sqs-creds auth-sqs-queue storage-sqs-queue
-                              auth-sqs-msg-handler storage-sqs-msg-handler] :as opts}]
+                              auth-sqs-msg-handler storage-sqs-msg-handler sentry] :as opts}]
   (component/system-map
-    :db-pool (map->RethinkPool {:size c/db-pool-size :regenerate-interval 5})
+    :sentry-capturer (map->SentryCapturer sentry)
+    :db-pool (component/using
+              (map->RethinkPool {:size c/db-pool-size :regenerate-interval 5})
+              [:sentry-capturer])
     :async-consumers (component/using
                         (map->AsyncConsumers {})
-                        [])
+                        [:sentry-capturer])
     :auth-notification (component/using
                   (map->AuthNotification {:auth-notification-fn auth-sqs-msg-handler})
                   [:db-pool])
@@ -128,7 +132,9 @@
                   (map->StorageNotification {:storage-notification-fn storage-sqs-msg-handler})
                   [:db-pool])
     :auth-sqs (sqs/sqs-listener sqs-creds auth-sqs-queue auth-sqs-msg-handler)
-    :storage-sqs (sqs/sqs-listener sqs-creds storage-sqs-queue storage-sqs-msg-handler)
+    :storage-sqs (component/using
+                  (sqs/sqs-listener sqs-creds storage-sqs-queue storage-sqs-msg-handler)
+                  [:sentry-capturer])
     :handler (component/using
                 (map->Handler {:handler-fn handler-fn})
                 [:db-pool])

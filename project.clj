@@ -40,8 +40,17 @@
     ;; Pretty-print clj and EDN https://github.com/kkinnear/zprint
     [zprint "0.5.4"]
     
+    ;; General data-binding functionality for Jackson: works on core streaming API https://github.com/FasterXML/jackson-databind
+    [com.fasterxml.jackson.core/jackson-databind "2.11.2"]
+
     ;; Library for OC projects https://github.com/open-company/open-company-lib
-    [open-company/lib "0.17.29-alpha17"]
+    ;; ************************************************************************
+    ;; ****************** NB: don't go under 0.17.29-alpha60 ******************
+    ;; ***************** (JWT schema changes, more info here: *****************
+    ;; ******* https://github.com/open-company/open-company-lib/pull/82) ******
+    ;; ************************************************************************
+    [open-company/lib "0.17.29-alpha67"]
+    ;; ************************************************************************
     ;; In addition to common functions, brings in the following common dependencies used by this project:
     ;; httpkit - HTTP client/server http://www.http-kit.org/
     ;; defun - Erlang-esque pattern matching for Clojure functions https://github.com/killme2008/defun
@@ -210,7 +219,7 @@
 
   :eastwood {
     ;; Disable some linters that are enabled by default
-    ;; contant-test - just seems mostly ill-advised, logical constants are useful in something like a `->cond` 
+    ;; constant-test - just seems mostly ill-advised, logical constants are useful in something like a `->cond` 
     ;; wrong-arity - unfortunate, but it's failing on 3/arity of sqs/send-message
     ;; implicit-dependencies - uhh, just seems dumb
     :exclude-linters [:constant-test :wrong-arity :implicit-dependencies]

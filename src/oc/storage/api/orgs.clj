@@ -2,10 +2,11 @@
   "Liberator API for org resources."
   (:require [clojure.walk :refer (keywordize-keys)]
             [if-let.core :refer (if-let*)]
+            [clojure.java.io :as j-io]
             [clj-time.core :as t]
             [clj-time.format :as f]
             [taoensso.timbre :as timbre]
-            [compojure.core :as compojure :refer (ANY OPTIONS GET POST DELETE)]
+            [compojure.core :as compojure :refer (ANY OPTIONS POST DELETE)]
             [liberator.core :refer (defresource by-method)]
             [schema.core :as schema]
             [oc.lib.time :as lib-time]
@@ -15,6 +16,7 @@
             [oc.lib.db.common :as db-common]
             [oc.lib.api.common :as api-common]
             [oc.lib.change.resources.follow :as follow]
+            [oc.lib.change.resources.seen :as seen]
             [oc.storage.config :as config]
             [oc.storage.async.notification :as notification]
             [oc.storage.api.access :as access]
@@ -24,7 +26,8 @@
             [oc.storage.resources.common :as common-res]
             [oc.storage.resources.org :as org-res]
             [oc.storage.resources.board :as board-res]
-            [oc.storage.resources.entry :as entry-res]))
+            [oc.storage.resources.entry :as entry-res]
+            [oc.storage.urls.org :as org-urls]))
 
 ;; ----- Utility functions -----
 
@@ -49,10 +52,10 @@
     (->> board-name
       (slugify/slugify)
       (format "samples/%s.edn")
-      (clojure.java.io/resource)
+      (j-io/resource)
       (slurp)
       (read-string))
-    (catch Exception e
+    (catch Exception _
       [])))
 
 (defn- create-interaction
@@ -133,7 +136,7 @@
 
     (do (timbre/error "Failed updating org:" slug) false)))
 
-(defn- add-author [conn ctx slug user-id]
+(defn- add-author [conn _ctx slug user-id]
   (timbre/info "Adding author:" user-id "to org:" slug)
   (if-let [updated-org (org-res/add-author conn slug user-id)]
     (do
@@ -144,7 +147,7 @@
       (timbre/error "Failed adding author:" user-id "to org:" slug)
       false)))
 
-(defn- remove-author [conn ctx slug user-id]
+(defn- remove-author [conn _ctx slug user-id]
   (timbre/info "Removing author:" user-id "from org:" slug)
   (if-let [updated-org (org-res/remove-author conn slug user-id)]
     (do
@@ -162,7 +165,7 @@
   (let [authed-orgs (org-res/list-orgs-by-teams conn (:teams user))]
     (zero? (count authed-orgs))))
 
-(defn- valid-new-org? [conn ctx]
+(defn- valid-new-org? [_conn ctx]
   (try
     ;; Create the new org from the data provided
     (let [org-map (:data ctx)
@@ -177,12 +180,16 @@
     (catch clojure.lang.ExceptionInfo e
       [false, {:reason (.getMessage e)}]))) ; Not a valid new org
 
-(defn- valid-org-update? [conn slug org-props]
+(defn- valid-org-update? [conn slug ctx]
   (if-let [org (org-res/get-org conn slug)]
-    (let [updated-org (merge org (org-res/ignore-props org-props))
+    (let [org-props (:data ctx)
+          updated-org (merge org (org-res/ignore-props org-props))
           updating-org-name? (contains? org-props :name)
-          org-name (:name org-props)]
+          org-name (:name org-props)
+          premium-org? (:premium? ctx)]
       (if (and (lib-schema/valid? common-res/Org updated-org)
+               (or premium-org?
+                   (not (contains? org-props :brand-color)))
                (or (not updating-org-name?)
                    (and updating-org-name?
                         (<= (count org-name) org-name-max-length)
@@ -195,7 +202,7 @@
 ;; ----- Resources - see: http://clojure-liberator.github.io/liberator/assets/img/decision-graph.svg
 
 ;; A resource for operations on a particular Org
-(defresource org [conn slug]
+(defresource org-item [conn slug]
   (api-common/open-company-anonymous-resource config/passphrase) ; verify validity of optional JWToken
 
   :allowed-methods [:options :get :patch]
@@ -220,7 +227,7 @@
   :processable? (by-method {
     :options true
     :get true
-    :patch (fn [ctx] (and (slugify/valid-slug? slug) (valid-org-update? conn slug (:data ctx))))})
+    :patch (fn [ctx] (and (slugify/valid-slug? slug) (valid-org-update? conn slug ctx)))})
 
   ;; Existentialism
   :exists? (fn [ctx] (if-let* [_slug? (slugify/valid-slug? slug)
@@ -239,11 +246,12 @@
                                                   (or (= (:access-level ctx) :author)
                                                       (= (:access-level ctx) :viewer)))
                              org-id (:uuid org)
-                             boards (board-res/list-boards-by-org conn org-id [:created-at :updated-at :authors :viewers :access :publisher-board :author :description])
+                             boards (board-res/list-boards-by-org conn org-id [:created-at :updated-at :authors :viewers :access :publisher-board :author :description :slack-mirror])
                              boards-with-entries-count (map #(assoc % :total-count (entry-res/list-entries-by-board conn (:uuid %) {:count true})) boards)
                              boards-with-last-entry-at (map #(assoc % :last-entry-at (:created-at (entry-res/last-entry-of-board conn (:uuid %)))) boards-with-entries-count)
                              board-access (map #(board-with-access-level org % user) boards-with-last-entry-at)
                              allowed-boards (filter :access-level board-access)
+                             allowed-board-uuids (map :uuid allowed-boards)
                              author-access-boards (filter #(= (:access-level %) :author) board-access)
                                                ;; Add the draft board
                              show-draft-board? (and ;; if user is logged in and
@@ -255,64 +263,53 @@
                              draft-entry-count (if show-draft-board?
                                                  (entry-res/list-drafts-by-org-author conn org-id user-id {:count true})
                                                  0)
+                             now (lib-time/now-ts)
                              total-count (if user-is-member?
-                                           (entry-res/paginated-entries-by-org conn org-id :asc (db-common/current-timestamp) :before 0 :recently-posted
-                                            (map :uuid allowed-boards) nil {:count true})
+                                           (entry-res/paginated-entries-by-org conn org-id :asc now :before 0 :recently-posted
+                                            allowed-board-uuids nil {:count true})
                                            0)
                              bookmarks-count (if user-is-member?
-                                              (entry-res/list-all-bookmarked-entries conn org-id user-id :asc (db-common/current-timestamp) :before
+                                              (entry-res/list-all-bookmarked-entries conn org-id user-id allowed-board-uuids :asc now :before
                                                0 {:count true})
                                               0)
                              follow-data (when user-is-member?
                                            (follow/retrieve config/dynamodb-opts user-id (:slug org)))
-                             following-count (if user-is-member?
-                                               (entry-res/paginated-entries-by-org conn org-id :asc (db-common/current-timestamp) :before 0 :recent-activity
-                                                (map :uuid allowed-boards) (assoc follow-data :following true) {:count true})
-                                               0)
-                             unfollowing-count (if user-is-member?
-                                                 (entry-res/paginated-entries-by-org conn org-id :asc (db-common/current-timestamp) :before 0 :recent-activity
-                                                  (map :uuid allowed-boards) (assoc follow-data :unfollowing true) {:count true})
-                                                 0)
-                             following-inbox-count (if user-is-member?
-                                                     (entry-res/list-all-entries-for-inbox conn org-id user-id :asc (db-common/current-timestamp)
-                                                      0 (map :uuid allowed-boards) (assoc follow-data :following true) {:count true})
-                                                     0)
-                             unfollowing-inbox-count (if user-is-member?
-                                                       (entry-res/list-all-entries-for-inbox conn org-id user-id :asc (db-common/current-timestamp)
-                                                        0 (map :uuid allowed-boards) (assoc follow-data :unfollowing true) {:count true})
-                                                       0)
-                             inbox-count (if user-is-member?
-                                           (entry-res/list-all-entries-for-inbox conn org-id user-id :asc (db-common/current-timestamp)
-                                            0 (map :uuid allowed-boards) nil {:count true})
-                                           0)
                              user-count (if user-is-member?
-                                          (entry-res/list-entries-by-org-author conn org-id user-id :asc (db-common/current-timestamp) :before
-                                            0 :recently-posted (map :uuid allowed-boards) {:count true})
+                                          (entry-res/list-entries-by-org-author conn org-id user-id :asc now :before
+                                            0 :recently-posted allowed-board-uuids nil {:count true})
                                            0)
                              full-boards (if show-draft-board?
                                             (conj allowed-boards (board-res/drafts-board org-id user))
                                             allowed-boards)
-                             board-reps (map #(board-rep/render-board-for-collection slug % draft-entry-count)
-                                          full-boards)
+                             following-seen (when user-is-member?
+                                         (seen/retrieve-by-user-container config/dynamodb-opts user-id config/seen-home-container-id))
+                             badge-following? (if user-is-member?
+                                                (pos?
+                                                 (entry-res/paginated-entries-by-org conn org-id :asc now :before 0 :recent-activity
+                                                  allowed-board-uuids follow-data (:seen-at following-seen) {:unseen true :count true}))
+                                                false)
+                             replies-seen (when user-is-member?
+                                            (seen/retrieve-by-user-container config/dynamodb-opts user-id config/seen-replies-container-id))
+                             badge-replies? (if user-is-member?
+                                              (pos?
+                                               (entry-res/list-entries-for-user-replies conn org-id allowed-board-uuids user-id :asc
+                                                now :before 0 follow-data (:seen-at replies-seen) {:count true :unseen true}))
+                                              false)
+                             board-reps (map #(board-rep/render-board-for-collection slug % ctx draft-entry-count) full-boards)
                              authors (:authors org)
                              author-reps (map #(org-rep/render-author-for-collection org % (:access-level ctx)) authors)
-                             has-sample-content? (> (entry-res/sample-entries-count conn org-id) 1)]
-                         (org-rep/render-org (-> org
-                                                 (assoc :boards (if user-is-member?
-                                                                  board-reps
-                                                                  (map #(dissoc % :authors :viewers) board-reps)))
-                                                 (assoc :total-count total-count)
-                                                 (assoc :bookmarks-count bookmarks-count)
-                                                 (assoc :following-count following-count)
-                                                 (assoc :unfollowing-count unfollowing-count)
-                                                 (assoc :inbox-count inbox-count)
-                                                 (assoc :following-inbox-count following-inbox-count)
-                                                 (assoc :unfollowing-inbox-count unfollowing-inbox-count)
-                                                 (assoc :contributions-count user-count)
-                                                 (assoc :authors author-reps))
-                                             (:access-level ctx)
-                                             user
-                                             has-sample-content?)))
+                             has-sample-content? (> (entry-res/sample-entries-count conn org-id) 1)
+                             org-map (-> org
+                                         (assoc :boards (if user-is-member?
+                                                          board-reps
+                                                          (map #(dissoc % :authors :viewers) board-reps)))
+                                         (assoc :total-count total-count)
+                                         (assoc :bookmarks-count bookmarks-count)
+                                         (assoc :badge-following badge-following?)
+                                         (assoc :badge-replies badge-replies?)
+                                         (assoc :contributions-count user-count)
+                                         (assoc :authors author-reps))]
+                         (org-rep/render-org org-map ctx has-sample-content?)))
   :handle-unprocessable-entity (fn [ctx]
     (api-common/unprocessable-entity-response (schema/check common-res/Org (:updated-org ctx)))))
 
@@ -348,10 +345,10 @@
                         {:existing-org (api-common/rep org)
                          :existing-author? (api-common/rep ((set (:authors org)) (:data ctx)))}
                         false))
-    :delete (fn [ctx] (if-let* [org (and (slugify/valid-slug? org-slug) (org-res/get-org conn org-slug))
-                                exists? ((set (:authors org)) user-id)] ; short circuits the delete w/ a 404
-                        {:existing-org (api-common/rep org) :existing-author? true}
-                        false))}) ; org or author doesn't exist
+    :delete (fn [_] (if-let* [org (and (slugify/valid-slug? org-slug) (org-res/get-org conn org-slug))
+                              _exists? ((set (:authors org)) user-id)] ; short circuits the delete w/ a 404
+                      {:existing-org (api-common/rep org) :existing-author? true}
+                      false))}) ; org or author doesn't exist
 
   ;; Actions
   :post! (fn [ctx] (when-not (:existing-author? ctx) (add-author conn ctx org-slug (:data ctx))))
@@ -413,7 +410,7 @@
   ;; Existentialism
   :exists? (by-method {
              :get (fn [ctx] (if-let* [team-id (:team-id ctx)
-                                      orgs (org-res/list-orgs-by-team conn team-id [:logo-url :logo-width :logo-height])]
+                                      orgs (org-res/list-orgs-by-team conn team-id [:logo-url :logo-width :logo-height :brand-color])]
                               (if (empty? orgs) false {:existing-orgs (api-common/rep orgs)})
                               false))})
 
@@ -425,21 +422,23 @@
                                   slug (:slug new-org)
                                   org-id (:uuid new-org)
                                   user-id (-> ctx :user :user-id)
-                                  boards (board-res/list-boards-by-org conn org-id [:created-at :updated-at :publisher-board :access])
-                                  board-reps (map #(board-rep/render-board-for-collection slug % 0)
-                                                (map #(assoc % :access-level :author) boards))
+                                  boards (board-res/list-boards-by-org conn org-id [:created-at :updated-at :publisher-board :access :slack-mirror])
+                                  board-reps (->> boards
+                                                  (map #(assoc % :access-level :author))
+                                                  (map #(board-rep/render-board-for-collection slug % ctx 0)))
                                   author-reps [(org-rep/render-author-for-collection new-org user-id :author)]
                                   org-for-rep (-> new-org
                                                 (assoc :authors author-reps)
                                                 (assoc :boards (map #(dissoc % :authors :viewers) board-reps)))
                                   has-sample-content? (> (entry-res/sample-entries-count conn org-id) 1)]
                               (api-common/location-response
-                                (org-rep/url slug)
-                                (org-rep/render-org org-for-rep :author (:user ctx) has-sample-content?)
+                                (org-urls/org slug)
+                                (org-rep/render-org org-for-rep (assoc ctx :access-level :author) has-sample-content?)
                                   mt/org-media-type)))
   :handle-ok (fn [ctx] (let [existing-orgs (:existing-orgs ctx)]
-                         (org-rep/render-org-list existing-orgs (:user ctx))))
+                         (org-rep/render-org-list existing-orgs ctx)))
   :handle-unprocessable-entity (fn [ctx]
+                                 (println "DBG render unproc entity" (:reason ctx))
     (api-common/unprocessable-entity-response (:reason ctx))))
 
 ;; ----- Routes -----
@@ -448,21 +447,21 @@
   (let [db-pool (-> sys :db-pool :pool)]
     (compojure/routes
       ;; Org creation and lookup
-      (ANY "/orgs" [] (pool/with-pool [conn db-pool] (org-list conn)))
-      (ANY "/orgs/" [] (pool/with-pool [conn db-pool] (org-list conn)))
+      (ANY org-urls/orgs [] (pool/with-pool [conn db-pool] (org-list conn)))
+      (ANY (str org-urls/orgs "/") [] (pool/with-pool [conn db-pool] (org-list conn)))
       ;; Org operations
-      (ANY "/orgs/:slug" [slug] (pool/with-pool [conn db-pool] (org conn slug)))
-      (ANY "/orgs/:slug/" [slug] (pool/with-pool [conn db-pool] (org conn slug)))
+      (ANY (org-urls/org ":slug") [slug] (pool/with-pool [conn db-pool] (org-item conn slug)))
+      (ANY (str (org-urls/org ":slug") "/") [slug] (pool/with-pool [conn db-pool] (org-item conn slug)))
       ;; Org author operations
-      (OPTIONS "/orgs/:slug/authors" [slug] (pool/with-pool [conn db-pool] (author conn slug nil)))
-      (OPTIONS "/orgs/:slug/authors/" [slug] (pool/with-pool [conn db-pool] (author conn slug nil)))
-      (POST "/orgs/:slug/authors" [slug] (pool/with-pool [conn db-pool] (author conn slug nil)))
-      (POST "/orgs/:slug/authors/" [slug] (pool/with-pool [conn db-pool] (author conn slug nil)))
-      (OPTIONS "/orgs/:slug/authors/:user-id" [slug user-id] (pool/with-pool [conn db-pool]
-        (author conn slug user-id)))
-      (OPTIONS "/orgs/:slug/authors/:user-id/" [slug user-id]
+      (OPTIONS (org-urls/org-authors ":slug") [slug] (pool/with-pool [conn db-pool] (author conn slug nil)))
+      (OPTIONS (str (org-urls/org-authors ":slug") "/") [slug] (pool/with-pool [conn db-pool] (author conn slug nil)))
+      (POST (org-urls/org-authors ":slug") [slug] (pool/with-pool [conn db-pool] (author conn slug nil)))
+      (POST (str (org-urls/org-authors ":slug") "/") [slug] (pool/with-pool [conn db-pool] (author conn slug nil)))
+      (OPTIONS (org-urls/org-author ":slug" ":user-id") [slug user-id]
         (pool/with-pool [conn db-pool] (author conn slug user-id)))
-      (DELETE "/orgs/:slug/authors/:user-id" [slug user-id]
+      (OPTIONS (str (org-urls/org-author ":slug" ":user-id") "/") [slug user-id]
         (pool/with-pool [conn db-pool] (author conn slug user-id)))
-      (DELETE "/orgs/:slug/authors/:user-id/" [slug user-id] (pool/with-pool [conn db-pool]
-        (author conn slug user-id))))))
+      (DELETE (org-urls/org-author ":slug" ":user-id") [slug user-id]
+        (pool/with-pool [conn db-pool] (author conn slug user-id)))
+      (DELETE (str (org-urls/org-author ":slug" ":user-id") "/")
+        [slug user-id] (pool/with-pool [conn db-pool] (author conn slug user-id))))))

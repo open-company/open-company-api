@@ -24,10 +24,10 @@
 
 ;; ----- Responses -----
 
-(defn- render-entry-point [conn {:keys [user request] :as _ctx}]
+(defn- render-entry-point [conn {:keys [user request] :as ctx}]
   (let [authed-orgs (if user
                 ;; Auth'd user
-                (org-res/list-orgs-by-teams conn (:teams user) [:uuid :team-id :logo-url :logo-width :logo-height :created-at :updated-at])
+                (org-res/list-orgs-by-teams conn (:teams user) [:uuid :team-id :logo-url :logo-width :logo-height :created-at :updated-at :brand-color])
                 ;; Not auth'd
                 [])
         org-uuids (set (map :uuid authed-orgs))
@@ -38,7 +38,7 @@
                                         (org-slugs requested-org-slug)))) ; or a valid slug of an org the user has access to
         public-org (when check-for-public? (org-if-public-boards conn requested-org-slug)) ; requested org if public
         orgs (if public-org (conj authed-orgs public-org) authed-orgs)] ; final set of orgs
-    (org-rep/render-org-list orgs user)))
+    (org-rep/render-org-list orgs ctx)))
     
 ;; ----- Resources - see: http://clojure-liberator.github.io/liberator/assets/img/decision-graph.svg
 
@@ -48,7 +48,7 @@
   :allowed-methods [:options :get]
   
   ;; Media type client accepts
-  :allowed? (fn [ctx] (api-common/allow-anonymous ctx))
+  :allowed? api-common/allow-anonymous
 
   :available-media-types ["application/json" mt/org-collection-media-type]
   :handle-not-acceptable (fn [_] (api-common/only-accept 406 ["application/json" mt/org-collection-media-type]))

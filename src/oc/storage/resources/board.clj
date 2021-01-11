@@ -4,6 +4,7 @@
             [defun.core :refer (defun)]
             [schema.core :as schema]
             [taoensso.timbre :as timbre]
+            [clojure.set :as clj-set]
             [oc.lib.user :as user-lib]
             [oc.lib.schema :as lib-schema]
             [oc.lib.slugify :as slug]
@@ -27,7 +28,7 @@
 
 (def reserved-properties
   "Properties of a resource that can't be specified during a create and are ignored during an update."
-  (clojure.set/union common/reserved-properties #{:authors :viewers}))
+  (clj-set/union common/reserved-properties #{:authors :viewers}))
 
 (def ignored-properties
   "Properties of a resource that are ignored during an update."
@@ -72,7 +73,7 @@
 
 ;; ----- Board Slug -----
 
-(def reserved-slugs #{"create-board" "settings" "boards" "all-posts" "drafts" "must-see" "bookmarks" "inbox" "new" "following" "unfollowing" "home" "threads"})
+(def reserved-slugs #{"create-board" "settings" "boards" "all-posts" "drafts" "must-see" "bookmarks" "inbox" "new" "following" "unfollowing" "home" "topics" "activity"})
 
 (declare list-boards-by-org)
 (defn taken-slugs
@@ -214,11 +215,11 @@
         (update-board! conn (:uuid board) (assoc board :draft true))))))
 
   ([conn :guard db-common/conn? org-uuid :guard #(schema/validate lib-schema/UniqueID %) slug :guard slug/valid-slug? entries :guard sequential?]
-  (if-let [board (get-board conn org-uuid slug)]
+  (when-let [board (get-board conn org-uuid slug)]
     (delete-board! conn board entries)))
 
   ([conn :guard db-common/conn? uuid :guard #(schema/validate lib-schema/UniqueID %) entries :guard sequential?]
-  (if-let [board (get-board conn uuid)]
+  (when-let [board (get-board conn uuid)]
     (delete-board! conn board entries))))
 
 ;; ----- Board's set operations -----

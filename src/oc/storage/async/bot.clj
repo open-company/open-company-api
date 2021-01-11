@@ -33,7 +33,6 @@
     :board-slug lib-schema/NonBlankStr
     :entry-uuid lib-schema/UniqueID
     :headline (schema/maybe schema/Str)
-    :abstract (schema/maybe schema/Str)
     :body (schema/maybe schema/Str)
     :must-see (schema/maybe schema/Bool)
     :video-id (schema/maybe lib-schema/NonBlankStr)
@@ -90,7 +89,6 @@
       :org-logo-url (:logo-url org)
       :entry-uuid (:uuid entry)
       :headline (:headline entry)
-      :abstract (:abstract entry)
       :body (:body entry)
       :must-see (:must-see entry)
       :video-id (:video-id entry)

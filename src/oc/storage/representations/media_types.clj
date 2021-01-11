@@ -19,7 +19,6 @@
 (def revert-request-media-type "application/vnd.open-company.revert-request.v1+json")
 (def poll-media-type "application/vnd.open-company.poll.v1+json")
 (def poll-reply-media-type "application/vnd.open-company.poll-reply.v1+json")
-(def thread-collection-media-type "application/vnd.collection+vnd.open-company.thread+json;version=1")
 
 ;; Interaction media types
 (def comment-media-type "application/vnd.open-company.comment.v1+json")
@@ -29,6 +28,3 @@
 
 ;; Reminder media types
 (def reminders-list-media-type "application/vnd.collection+vnd.open-company.reminder+json;version=1")
-
-;; Payments media types
-(def payments-customer-media-type "application/vnd.open-company.customer.v1+json")

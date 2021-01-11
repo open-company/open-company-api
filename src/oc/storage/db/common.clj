@@ -2,7 +2,6 @@
   "CRUD function to retrieve entries from RethinkDB with pagination."
   (:require [clj-time.core :as t]
             [clj-time.format :as f]
-            [clj-time.coerce :as c]
             [rethinkdb.query :as r]
             [oc.lib.schema :as lib-schema]
             [oc.lib.time :as lib-time]
@@ -11,17 +10,17 @@
 
 (defn read-paginated-entries
  ([conn table-name index-name index-value order start direction limit sort-type relation-table-name allowed-boards
-   relation-fields {:keys [count] :or {count false}}]
+   relation-fields {:keys [count unseen] :or {count false unseen false}}]
  (read-paginated-entries conn table-name index-name index-value order start direction limit sort-type relation-table-name allowed-boards
-  nil relation-fields nil {:count count}))
+  nil nil relation-fields nil {:count count :unseen false}))
 
  ([conn table-name index-name index-value order start direction limit sort-type relation-table-name allowed-boards
-   relation-fields user-id {:keys [count] :or {count false}}]
+   relation-fields user-id {:keys [count unseen] :or {count false unseen false}}]
   (read-paginated-entries conn table-name index-name index-value order start direction limit sort-type relation-table-name allowed-boards
-  nil relation-fields user-id {:count count}))
+  nil nil relation-fields user-id {:count count :unseen false}))
 
  ([conn table-name index-name index-value order start direction limit sort-type relation-table-name allowed-boards
-  follow-data relation-fields user-id {:keys [count] :or {count false}}]
+  follow-data container-last-seen-at relation-fields user-id {:keys [count unseen] :or {count false unseen false}}]
  {:pre [(db-common/conn? conn)
         (db-common/s-or-k? table-name)
         (db-common/s-or-k? index-name)
@@ -34,10 +33,19 @@
         (or (#{:recent-activity :recently-posted} sort-type)
             (and (= sort-type :bookmarked-at)
                  (seq user-id)))
+        (or (nil? container-last-seen-at)
+            (string? container-last-seen-at))
+        (or (nil? follow-data)
+            (coll? follow-data))
         (sequential? relation-fields)
-        (every? db-common/s-or-k? relation-fields)]}
+        (every? db-common/s-or-k? relation-fields)
+        (boolean? count)
+        (boolean? unseen)]}
   (let [index-values (if (sequential? index-value) index-value [index-value])
-        order-fn (if (= order :desc) r/desc r/asc)]
+        order-fn (if (= order :desc) r/desc r/asc)
+        unseen-cap-ms (if (zero? config/unseen-cap-days)
+                        (* 60 60 24 365 50 1000) ;; default is 50 years cap if no config is set
+                        (* 60 60 24 config/unseen-cap-days 1000))]
     (db-common/with-timeout db-common/default-timeout
       (as-> (r/table table-name) query
             (r/get-all query index-values {:index index-name})
@@ -56,35 +64,61 @@
                            (r/and (:unfollowing follow-data)
                                   (r/not (r/contains (vec (:follow-publisher-uuids follow-data)) (r/get-field post-row [:publisher :user-id])))
                                   (r/contains (vec (:unfollow-board-uuids follow-data)) (r/get-field post-row :board-uuid)))))))
-            ;; Merge in a last-activity-at date for each post, which is the
-            ;; last comment created-at, with fallback to published-at or created-at for published entries
-            ;; the entry created-at in all the other cases.
+            ;; Merge in last-activity-at, last-seen-at and sort-value
             (r/merge query (r/fn [post-row]
-              (cond
-                (= sort-type :recent-activity)
-                {:last-activity-at (-> (r/table relation-table-name)
-                                       (r/get-all [[(r/get-field post-row :uuid) true]] {:index :resource-uuid-comment})
-                                       (r/max :created-at)
-                                       (r/get-field :created-at)
-                                       (r/default (r/get-field post-row :published-at))
-                                       (r/default (r/get-field post-row :created-at)))}
-                (= sort-type :bookmarked-at)
-                {:last-activity-at (r/default
-                                    (-> (r/get-field post-row [:bookmarks])
-                                        (r/filter {:user-id user-id})
-                                        (r/nth 0)
-                                        (r/get-field :bookmarked-at))
-                                    (r/get-field post-row :published-at))}
-                :else
-                {:last-activity-at (r/default
-                                    (r/get-field post-row :published-at)
-                                    (r/get-field post-row :created-at))})))
+              (let [last-activity-at (-> (r/table relation-table-name)
+                                      (r/get-all [[(r/get-field post-row :uuid) true]] {:index :resource-uuid-comment})
+                                      (r/max :created-at)
+                                      (r/get-field :created-at)
+                                      (r/default (r/get-field post-row :published-at))
+                                      (r/default (r/get-field post-row :created-at)))
+                    sort-field (cond
+                                (= sort-type :recent-activity)
+                                last-activity-at
+                                (= sort-type :bookmarked-at)
+                                (-> (r/get-field post-row [:bookmarks])
+                                 (r/filter {:user-id user-id})
+                                 (r/nth 0)
+                                 (r/get-field :bookmarked-at)
+                                 (r/default (r/get-field post-row :published-at))
+                                 (r/default (r/get-field post-row :created-at)))
+                                :else
+                                (r/default
+                                 (r/get-field post-row :published-at)
+                                 (r/get-field post-row :created-at)))
+                    sort-value-base (-> sort-field
+                                     (r/iso8601)
+                                     (r/to-epoch-time)
+                                     (r/mul 1000)
+                                     (r/round))
+                    unseen-entry? (r/and (seq container-last-seen-at)
+                                         (r/gt (r/get-field post-row :published-at) container-last-seen-at))
+                    unseen-with-cap? (r/and unseen-entry?
+                                            (r/gt sort-value-base
+                                                  (-> (r/now) (r/to-epoch-time) (r/mul 1000) (r/round) (r/sub unseen-cap-ms))))
+                    sort-value (r/branch unseen-with-cap?
+                                ;; If the item is unseen and was published (for recently posted) or bookmarked
+                                ;; (for bookmarks) or last activity was (for recent activity) in the cap window
+                                ;; let's add the cap window to the publish timestamp so it will sort before the seen ones
+                                (r/add sort-value-base unseen-cap-ms)
+                                ;; Or use the plain sort value in case it's seen or it's out of the cap window
+                                sort-value-base)]
+                {;; Date of the last added comment on this entry
+                 :last-activity-at last-activity-at
+                 :publish-time sort-value-base
+                 :sort-value sort-value
+                 :unseen unseen-with-cap?
+                })))
             ;; Filter out:
-            (r/filter query (r/fn [post-row]
+            (r/filter query (r/fn [row]
               ;; All records after/before the start
-              (if (= direction :before)
-                (r/gt start (r/get-field post-row :last-activity-at))
-                (r/le start (r/get-field post-row :last-activity-at)))))
+              (r/and ;; Filter out seen entries if unseen flag is on
+                     (r/or (r/not unseen)
+                           (r/default (r/get-field row :unseen) false))
+                     (r/or (r/and (= direction :before)
+                                  (r/gt start (r/get-field row :publish-time)))
+                           (r/and (= direction :after)
+                                  (r/le start (r/get-field row :publish-time)))))))
             ;; Merge in all the interactions
             (if-not count
               (r/merge query (r/fn [post-row]
@@ -93,7 +127,9 @@
                                    (r/pluck relation-fields)
                                    (r/coerce-to :array))}))
               query)
-            (if-not count (r/order-by query (order-fn :last-activity-at)) query)
+            (if-not count
+              (r/order-by query (order-fn :sort-value))
+              query)
             ;; Apply count if needed
             (if count (r/count query) query)
             ;; Apply limit
@@ -152,14 +188,21 @@
                                         (r/not (r/contains (vec (:unfollow-board-uuids follow-data)) (r/get-field post-row :board-uuid)))))))))
             ;; Merge in a last-activity-at date for each post (last comment created-at, fallback to published-at)
             (r/merge query (r/fn [post-row]
-              {:last-activity-at (-> (r/table relation-table-name)
-                                     (r/get-all [[(r/get-field post-row :uuid) true]] {:index :resource-uuid-comment})
-                                     (r/filter (r/fn [interaction-row]
-                                       (r/ne (r/get-field interaction-row [:author :user-id]) user-id)))
-                                     (r/max :created-at)
-                                     (r/get-field [:created-at])
-                                     (r/default (r/get-field post-row :published-at))
-                                     (r/default (r/get-field post-row :created-at)))}))
+              (let [last-activity-at (-> (r/table relation-table-name)
+                                      (r/get-all [[(r/get-field post-row :uuid) true]] {:index :resource-uuid-comment})
+                                      (r/filter (r/fn [interaction-row]
+                                        (r/ne (r/get-field interaction-row [:author :user-id]) user-id)))
+                                      (r/max :created-at)
+                                      (r/get-field [:created-at])
+                                      (r/default (r/get-field post-row :published-at))
+                                      (r/default (r/get-field post-row :created-at)))
+                    sort-value (-> last-activity-at
+                                (r/iso8601)
+                                (r/to-epoch-time)
+                                (r/mul 1000)
+                                (r/round))]
+                {:last-activity-at last-activity-at
+                 :sort-value sort-value})))
             ;; Filter out:
             (r/filter query (r/fn [post-row]
               (r/and ;; Leave in only posts whose last activity is within a certain amount of time
@@ -177,9 +220,9 @@
               query)
             ;; Apply a filter on the last-activity-at date
             (r/filter query (r/fn [row]
-             (r/gt start (r/get-field row :last-activity-at))))
+             (r/gt start (r/get-field row :sort-value))))
             ;; Sort records when not counting
-            (if-not count (r/order-by query (order-fn :last-activity-at)) query)
+            (if-not count (r/order-by query (order-fn :sort-value)) query)
             ;; Apply count if needed
             (if count (r/count query) query)
             ;; Apply limit
@@ -237,9 +280,10 @@
       (db-common/read-resource conn table-name entry-uuid)
       (throw (RuntimeException. (str "RethinkDB update failure: " update))))))
 
-(defn read-paginated-threads
-  "Query that reads all the threads"
-  [conn org-uuid allowed-boards user-id follow-data read-items order start direction limit {:keys [count] :or {count false}}]
+(defn read-paginated-entries-for-replies
+  "Read all entries with at least one comment the user has access to. Filter out those not activily followed
+   by the current user. Sort those with unseen content at the top and sort everything by last activity descendant."
+  [conn org-uuid allowed-boards user-id order start direction limit follow-data container-last-seen-at relation-fields {:keys [count unseen] :or {count false unseen false}}]
   {:pre [(db-common/conn? conn)
          (lib-schema/unique-id? org-uuid)
          (or (sequential? allowed-boards)
@@ -247,97 +291,111 @@
          (lib-schema/unique-id? user-id)
          (or (nil? follow-data)
              (map? follow-data))
-         (or (nil? read-items)
-             (coll? read-items))
+         (or (nil? container-last-seen-at)
+             (string? container-last-seen-at))
          (#{:desc :asc} order)
          (not (nil? start))
          (#{:after :before} direction)
          (or (zero? limit) ;; means all
              (pos? limit))
-         (boolean? count)]}
+         (or (nil? relation-fields)
+             (coll? relation-fields))
+         (boolean? count)
+         (boolean? unseen)]}
   (let [order-fn (if (= order :desc) r/desc r/asc)
-        unread-cap-ms (if (zero? config/threads-unread-cap-days)
+        unseen-cap-ms (if (zero? config/unseen-cap-days)
                         (* 60 60 24 365 50 1000) ;; 50 years cap
-                        (* 60 60 24 config/threads-unread-cap-days 1000))
-        read-items-map (r/coerce-to (zipmap (map :item-id read-items) (map :read-at read-items)) :object)]
+                        (* 60 60 24 config/unseen-cap-days 1000))]
     (db-common/with-timeout db-common/default-timeout
-      (as-> (r/table "interactions") query
-       (r/get-all query [[org-uuid true true]] {:index :org-uuid-root-comments})
+      (as-> (r/table "entries") query
+       (r/get-all query [[:published org-uuid]] {:index :status-org-uuid})
        ;; Make an initial filter to select only posts the user has access to
        (r/filter query (r/fn [row]
         (r/or (not (sequential? allowed-boards))
               (r/contains allowed-boards (r/get-field row :board-uuid)))))
        ;; Merge in last-activity-at and entry
        (r/merge query (r/fn [row]
-        (let [interactions-base (-> (r/table "interactions") (r/get-all [(r/get-field row :uuid)] {:index :parent-uuid}))
+        (let [interactions-base (-> (r/table "interactions")
+                                 (r/get-all [[(r/get-field row :uuid) true]] {:index :resource-uuid-comment}))
               last-activity-at (-> interactions-base
-                                (r/max :created-at)
-                                (r/get-field :created-at)
-                                ;; Default to the root comment created-at
-                                (r/default (r/get-field row :created-at)))
-              sort-value-base (-> interactions-base
-                               (r/max :created-at)
-                               (r/get-field :created-at)
-                               ;; Default to the root comment created-at
-                               (r/default (r/get-field row :created-at))
+                                 (r/max :created-at)
+                                 (r/get-field :created-at)
+                                 (r/default (r/get-field row [:published-at])))
+              sort-value-base (-> last-activity-at
                                (r/iso8601)
                                (r/to-epoch-time)
                                (r/mul 1000)
                                (r/round))
-              entries-base (-> (r/table "entries") (r/get (r/get-field row [:resource-uuid])))
-              unread-thread? (r/or (r/not (r/contains (r/keys read-items-map) (r/get-field row :resource-uuid)))
-                                   (r/gt (-> last-activity-at (r/iso8601) (r/to-epoch-time) (r/mul 1000) (r/round))
-                                         (-> (r/get-field row :resource-uuid)
-                                          (as-> x (r/get-field read-items-map x))
-                                          (r/iso8601)
-                                          (r/to-epoch-time)
-                                          (r/mul 1000)
-                                          (r/round))))
-              unread-with-cap? (r/and unread-thread?
-                                      (r/gt (-> last-activity-at (r/iso8601) (r/to-epoch-time) (r/mul 1000) (r/round))
-                                            (-> (r/now) (r/to-epoch-time) (r/mul 1000) (r/round) (r/sub unread-cap-ms))))]
-          {:reply-count (r/count interactions-base)
-           ;; Date of the last added comment on this thread
+              published-ms (-> (r/get-field row [:published-at]) (r/iso8601) (r/to-epoch-time) (r/mul 1000) (r/round))
+              has-seen-at? (seq container-last-seen-at)
+              container-seen-ms (when has-seen-at?
+                                  (-> container-last-seen-at
+                                   (r/iso8601)
+                                   (r/to-epoch-time)
+                                   (r/mul 1000)
+                                   (r/round)))
+              last-activity-ms (-> last-activity-at
+                                (r/iso8601)
+                                (r/to-epoch-time)
+                                (r/mul 1000)
+                                (r/round))
+              unseen-entry? (r/or (r/not has-seen-at?)
+                                  (r/gt published-ms container-seen-ms))
+              unseen-cap-ms (-> (r/now) (r/to-epoch-time) (r/mul 1000) (r/round) (r/sub unseen-cap-ms))
+              unseen-activity? (r/or unseen-entry?
+                                     (r/gt last-activity-ms container-seen-ms))
+              unseen-with-cap? (r/and unseen-activity?
+                                      (r/gt last-activity-ms unseen-cap-ms))
+              sort-value (r/branch unseen-with-cap?
+                           ;; If the item is unseen and was published in the cap window
+                           ;; let's add the cap window to the publish timestamp so it will sort before the seen items
+                           (r/add sort-value-base unseen-cap-ms)
+                           ;; The timestamp in seconds
+                           sort-value-base)]
+          {;; Date of the last added comment on this thread
            :last-activity-at last-activity-at
-           :unread-thread unread-with-cap?
-           :last-read-at (r/branch (r/contains (r/keys read-items-map) (r/get-field row :resource-uuid))
-                           (r/get-field read-items-map (r/get-field row :resource-uuid))
-                           nil)
-           :reply-authors (-> interactions-base
-                           (r/coerce-to :array)
-                           (r/map (r/fn [inter] (r/get-field inter [:author :user-id])))
-                           (r/default []))
-           :sort-value (r/branch unread-with-cap?
-                         ;; If the item is unread and was published in the cap window
-                         ;; let's add the cap window to the publish timestamp so it will sort before the read items
-                         (r/add sort-value-base unread-cap-ms)
-                         ;; The timestamp in seconds
-                         sort-value-base)
-           ;; Entry data
-           :entry  (r/pluck entries-base [:publisher])})))
+           :comments-count (r/count interactions-base)
+           :sort-value sort-value
+           :unseen unseen-entry?
+           :last-activity-ms last-activity-ms
+           ; :reply-authors (-> interactions-base
+           ;                 (r/coerce-to :array)
+           ;                 (r/map (r/fn [inter] (r/get-field inter [:author :user-id])))
+           ;                 (r/default []))
+           :interactions (-> (r/table "interactions")
+                          (r/get-all [(r/get-field row :uuid)] {:index :resource-uuid})
+                          (r/pluck relation-fields)
+                          (r/coerce-to :array))
+           ;; FIXME: debug
+           ; :debug {:unseen-with-cap unseen-with-cap?
+           ;         :unseen-activity unseen-activity?}
+          })))
        ;; Filter by user-visibility
        (r/filter query (r/fn [row]
-        (r/and ;; Filter out threads that have comments only from the current user
-               (r/not (r/and (r/eq (r/get-field row [:author :user-id]) user-id)
-                             (-> (r/get-field row [:reply-authors])
-                               (r/filter user-id)
-                               (r/is-empty))))
+        (r/and (r/gt (r/get-field row [:comments-count]) 0)
+               ;; Filter out entries without unseen comments if unseen flag is on
+               (r/or (r/not unseen)
+                     (r/default (r/get-field row :unseen-comments) false))
+               ;; Filter out threads that have comments only from the current user
+               ; (-> (r/get-field row [:reply-authors])
+               ;  (r/filter user-id)
+               ;  (r/is-empty)
+               ;  r/not)
                ;; All records after/before the start
                (r/or (r/and (= direction :before)
-                            (r/gt start (r/get-field row :sort-value)))
+                            (r/gt start (r/get-field row :last-activity-ms)))
                      (r/and (= direction :after)
-                            (r/le start (r/get-field row :sort-value))))
-               ;; and filter on follow data:
-               (r/or ;; no filter if it's nil
-                     (not (map? follow-data))
-                     ;; filter on followed authors and on not unfollowed boards
-                     (r/and (:following follow-data)
-                            (r/or (r/contains (vec (:follow-publisher-uuids follow-data)) (r/get-field row [:entry :publisher :user-id]))
-                                  (r/not (r/contains (vec (:unfollow-board-uuids follow-data)) (r/get-field row :board-uuid)))))
-                     ;; filter on not followed authors and on unfollowed boards
-                     (r/and (:unfollowing follow-data)
-                            (r/not (r/contains (vec (:follow-publisher-uuids follow-data)) (r/get-field row [:entry :publisher :user-id])))
-                            (r/contains (vec (:unfollow-board-uuids follow-data)) (r/get-field row :board-uuid)))))))
+                            (r/le start (r/get-field row :last-activity-ms))))
+               ;; Filter on the user's visibility map:
+               (r/or ;; has :follow true
+                     (-> row
+                      (r/get-field [:user-visibility (keyword user-id) :follow])
+                      (r/default false))
+                     ;; has :unfollow false (key actually exists)
+                     (-> row
+                      (r/get-field [:user-visibility (keyword user-id) :unfollow])
+                      (r/default true)
+                      (r/not))))))
        ;; Sort
        (if-not count
         (r/order-by query (order-fn :sort-value))
@@ -354,27 +412,6 @@
        (if (= (type query) rethinkdb.net.Cursor)
          (seq query)
          query)))))
-
-
-(defn read-entries-list
-  "Given a list of entry uuids return the complete data for them."
-  ([conn org-uuid entry-uuids comment-properties]
-   (as-> (r/table "entries") query
-    (r/get-all query [org-uuid] {:index :org-uuid})
-    (r/filter query (r/fn [row] (r/contains entry-uuids (r/get-field row :uuid))))
-    (r/pluck query [:uuid :secure-uuid :status :user-visibility :org-uuid :board-uuid
-                    :headline :body :attachments :publisher :published-at :author
-                    :created-at :updated-at :revision-id :bookmarks :polls])
-    ;; Merge in all the interactions
-    (r/merge query (r/fn [post-row]
-     {:interactions (-> (r/table "interactions")
-                        (r/get-all [(r/get-field post-row :uuid)] {:index :resource-uuid})
-                        (r/pluck comment-properties)
-                        (r/coerce-to :array))}))
-    (r/run query conn)
-    (if (= (type query) rethinkdb.net.Cursor)
-      (seq query)
-      query))))
 
 (defn last-entry-of-board
   [conn board-uuid]

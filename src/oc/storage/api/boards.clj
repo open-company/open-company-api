@@ -1,9 +1,9 @@
 (ns oc.storage.api.boards
   "Liberator API for board resources."
   (:require [if-let.core :refer (if-let*)]
-            [defun.core :refer (defun-)]
             [taoensso.timbre :as timbre]
-            [compojure.core :as compojure :refer (defroutes ANY OPTIONS POST)]
+            [clojure.set :as clj-set]
+            [compojure.core :as compojure :refer (ANY OPTIONS POST)]
             [liberator.core :refer (defresource by-method)]
             [clojure.walk :refer (keywordize-keys)]
             [schema.core :as schema]
@@ -11,7 +11,7 @@
             [oc.lib.slugify :as slugify]
             [oc.lib.db.pool :as pool]
             [oc.lib.api.common :as api-common]
-            [oc.lib.db.common :as db-common]
+            [oc.lib.time :as oc-time]
             [oc.storage.config :as config]
             [oc.storage.api.access :as access]
             [oc.storage.api.entries :as entries-api]
@@ -22,24 +22,22 @@
             [oc.storage.resources.org :as org-res]
             [oc.storage.resources.board :as board-res]
             [oc.storage.resources.entry :as entry-res]
-            [oc.storage.lib.timestamp :as ts]
-            [oc.storage.urls.board :as board-url]))
+            [oc.storage.urls.board :as board-urls]))
 
 ;; ----- Utility functions -----
 
 (defn- default-board-params []
   {:sort-type :recent-activity
-   :start (db-common/current-timestamp)
-   :direction :before})
+   :start (oc-time/now-ts)
+   :direction :before
+   :limit 0})
 
-(defun- assemble-board
+(defn- assemble-board
   "Assemble the entry, author, and viewer data needed for a board response."
 
   ;; Draft board
-  ([conn org :guard map? board :guard #(or (:draft %) (= (:slug %) (:slug board-res/default-drafts-board))) ctx]
-  (let [org-slug (:slug org)
-        slug (:slug board)
-        all-drafts (entry-res/list-drafts-by-org-author conn (:uuid org) (-> ctx :user :user-id) {})
+  ([conn org board ctx]
+  (let [all-drafts (entry-res/list-drafts-by-org-author conn (:uuid org) (-> ctx :user :user-id) {})
         entries (if (:draft board)
                   (filterv #(= (:board-uuid %) (:uuid board)) all-drafts)
                   all-drafts)
@@ -48,15 +46,12 @@
                   :total-count (count entries)})))
 
   ;; Regular paginated board
-  ([conn org :guard map? board :guard map? params :guard map? ctx]
-  (let [{start :start direction :direction must-see :must-see sort-type :sort-type} params
-        access-level (:access-level ctx)
-        user-id (-> ctx :user :user-id)
-        total-count (entry-res/paginated-entries-by-board conn (:uuid board) :asc (db-common/current-timestamp) :before
+  ([conn _org board {start :start direction :direction must-see :must-see sort-type :sort-type limit :limit} _ctx]
+  (let [total-count (entry-res/paginated-entries-by-board conn (:uuid board) :asc (oc-time/now-ts) :before
                      0 :recently-posted {:must-see must-see :status :published :count true})
         order (if (= direction :before) :desc :asc)
         entries (entry-res/paginated-entries-by-board conn (:uuid board) order start direction
-                 config/default-activity-limit sort-type {:must-see must-see :status :published})]
+                 limit sort-type {:must-see must-see :status :published})]
     ;; Give each activity its board name
     (merge board {:next-count (count entries)
                   :direction direction
@@ -74,7 +69,7 @@
     (let [clean-entry (dissoc entry :publisher-board)]
       (entry-res/->entry conn entry-res/temp-uuid clean-entry author))))
 
-(defn- valid-new-board? [conn org-slug {board-map :data author :user}]
+(defn- valid-new-board? [conn org-slug board-access {board-map :data author :user}]
   (if-let [org (org-res/get-org conn org-slug)]
     (try
       (let [notifications (:private-notifications board-map)
@@ -87,11 +82,16 @@
                                          (:name author)
                                          %)))]
         (cond (and (:disallow-public-board (or (:content-visibility org) {}))
-                         (= (:access board-data) "public"))
+                   (= (:access board-data) "public"))
               [false, {:reason :disallowed-public-board}]
               (and (:publisher-board board-data)
                    (not config/publisher-board-enabled?))
               [false, {:reason :disallowed-publisher-board}]
+              (and (not (:pre-flight board-map))
+                   (not= (keyword (:access board-data)) board-access))
+              [false, {:reason (keyword (str (when (:access board-data)
+                                               (str (:access board-data) "-"))
+                                             "acess-on-" (name board-access) "-endpoint"))}]
               :else
               {:new-board (api-common/rep (board-res/->board (:uuid org) board-data author))
                :existing-org (api-common/rep org)
@@ -101,21 +101,40 @@
         [false, {:reason (.getMessage e)}])) ; Not a valid new board
     [false, {:reason :invalid-org}])) ; couldn't find the specified org
 
-(defn- valid-board-update? [conn org-slug slug board-props]
-  (if-let* [org (org-res/get-org conn org-slug)
-            board (board-res/get-board conn (:uuid org) slug)
-            board-data (dissoc board-props :private-notifications :note)]
-    (if (and (:disallow-public-board (or (:content-visibility org) {}))
-             (not= (:access board) "public")
-             (= (:access board-data) "public"))
-      [false, {:reason :disallowed-public-board}]
-      (let [updated-board (merge board (board-res/clean board-data))]
-        (if (lib-schema/valid? common-res/Board updated-board)
-          {:existing-org (api-common/rep org)
-           :existing-board (api-common/rep board)
-           :board-update (api-common/rep updated-board)
-           :notifications (api-common/rep (:private-notifications board-props))}
-          [false, {:board-update (api-common/rep updated-board)}]))) ; invalid update
+(defn- valid-board-access-update?
+  "If changing access of a board, make sure the change is allowed:
+   - no public boards if disallowed by org settings
+   - no private or public boards if not on premium."
+  [premium? disallow-public-board original-access updating-access]
+  (if (= original-access updating-access)
+    true
+    (let [public-access-check (or (not disallow-public-board)
+                                  (not= updating-access "public"))
+          premium-access-check (or premium?
+                                   (= updating-access "team"))]
+      (and public-access-check
+           premium-access-check))))
+
+(defn- valid-board-update? [conn org-slug slug ctx]
+  (if-let* [updating-board (-> ctx
+                               :data
+                               (dissoc :private-notifications :note))
+            org (org-res/get-org conn org-slug)
+            original-board (board-res/get-board conn (:uuid org) slug)]
+    ;; Check public board change
+    (let [valid-access-update? (valid-board-access-update? (:premium? ctx) (:disallow-public-board (:content-visibility org))
+                                                           `(:access original-board) (:access updating-board))
+          updated-board (merge original-board (board-res/clean updating-board))
+          valid-updated-board? (lib-schema/valid? common-res/Board updated-board)]
+      (cond (not valid-access-update?)
+            [false, {:reason :board-access-not-allowed}]
+            (not valid-updated-board?)
+            [false, {:board-update (api-common/rep updated-board)}]
+            :else
+            {:existing-org (api-common/rep org)
+             :existing-board (api-common/rep original-board)
+             :board-update (api-common/rep updated-board)
+             :notifications (api-common/rep (:private-notifications updating-board))}))
     true)) ; No org or board, so this will fail existence check later
 
 ;; ----- Actions -----
@@ -174,8 +193,8 @@
         (doseq [viewer viewers] (add-member conn ctx (:slug org) (:slug board-result) :viewers viewer))
         ;; Add any entries specified in the request
         (doseq [entry entries]
-          (let [old-board (when (and (:uuid entry) (:board-uuid entry))
-                            (board-res/get-board conn (:board-uuid entry)))
+          (let [_old-board (when (and (:uuid entry) (:board-uuid entry))
+                             (board-res/get-board conn (:board-uuid entry)))
                 fixed-entry (-> entry
                              (assoc :board-uuid board-uuid)
                              (dissoc :publisher-board))
@@ -240,15 +259,15 @@
           (add-member conn ctx org-slug slug :authors user-id)) ; make the current user an author
         ;; If authors are specified, make any requested author changes as a "sync"
         (when new-authors
-          (doseq [author (clojure.set/difference (set new-authors) current-authors)]
+          (doseq [author (clj-set/difference (set new-authors) current-authors)]
             (add-member conn ctx (:slug org) (:slug updated-result) :authors author))
-          (doseq [author (clojure.set/difference current-authors (set new-authors))]
+          (doseq [author (clj-set/difference current-authors (set new-authors))]
             (remove-member conn ctx (:slug org) (:slug updated-result) :authors author)))
         ;; If viewers are specified, make any requested viewer changes as a "sync"
         (when new-viewers
-          (doseq [viewer (clojure.set/difference (set new-viewers) current-viewers)]
+          (doseq [viewer (clj-set/difference (set new-viewers) current-viewers)]
             (add-member conn ctx (:slug org) (:slug updated-result) :viewers viewer))
-          (doseq [viewer (clojure.set/difference current-viewers (set new-viewers))]
+          (doseq [viewer (clj-set/difference current-viewers (set new-viewers))]
             (remove-member conn ctx (:slug org) (:slug updated-result) :viewers viewer))))
       (let [final-result (board-res/get-board conn (:uuid updated-result))]
         (notification/send-trigger! (notification/->trigger :update org {:old board :new final-result :notifications notifications} user invitation-note))
@@ -296,9 +315,9 @@
 
   :malformed? (by-method {
     :options false
-    :get (fn [ctx] (let [ctx-params (keywordize-keys (-> ctx :request :params))
+    :get (fn [ctx] (let [ctx-params (-> ctx :request :params keywordize-keys)
                          start (:start ctx-params)
-                         valid-start? (if start (ts/valid-timestamp? start) true)
+                         valid-start? (if start (try (Long. start) (catch java.lang.NumberFormatException _ false)) true)
                          valid-sort? (or (not (contains? ctx-params :sort))
                                          (= (:sort ctx-params) "activity"))
                          direction (keyword (:direction ctx-params))
@@ -317,7 +336,7 @@
     :get true
     :patch (fn [ctx] (and (slugify/valid-slug? org-slug)
                           (slugify/valid-slug? slug)
-                          (valid-board-update? conn org-slug slug (:data ctx))))
+                          (valid-board-update? conn org-slug slug ctx)))
     :delete true})
 
   ;; Existentialism
@@ -342,17 +361,19 @@
   :delete! (fn [ctx] (delete-board conn ctx org-slug slug))
   
   ;; Responses
-  :handle-ok (fn [ctx] (let [org (:existing-org ctx)
+  :handle-ok (fn [ctx] (let [ctx-params (-> ctx :request :params keywordize-keys)
+                             org (:existing-org ctx)
                              board (or (:updated-board ctx) (:existing-board ctx))
-                             ctx-params (keywordize-keys (-> ctx :request :params))
-                             sort (:sort ctx-params)
-                             sort-type (if (= sort "activity") :recent-activity :recently-posted)
-                             start-params (update ctx-params :start #(or % (db-common/current-timestamp))) ; default is now
-                             direction (or (#{:after} (keyword (:direction ctx-params))) :before) ; default is before
                              drafts-board? (board-rep/drafts-board? board)
-                             ;; For drafts board don't use parameters
                              params (when-not drafts-board?
-                                      (merge start-params {:direction direction :sort-type sort-type}))
+                                      (-> ctx-params
+                                       (dissoc :org-slug)
+                                       (update :start #(if % (Long. %) (oc-time/now-ts)))  ; default is now
+                                       (update :direction #(if % (keyword %) :before)) ; default is before
+                                       (assoc :limit (if (= :after (keyword (:direction ctx-params)))
+                                                       0 ;; In case of a digest request or if a refresh request
+                                                       config/default-activity-limit)) ;; fallback to the default pagination otherwise
+                                       (assoc :sort-type (if (= (:sort ctx-params) "activity") :recent-activity :recently-posted))))
                              full-board (if drafts-board?
                                           (assemble-board conn org board ctx)
                                           (assemble-board conn org board params ctx))]
@@ -362,7 +383,7 @@
 
 
 ;; A resource for operations on a list of boards
-(defresource board-list [conn org-slug]
+(defresource board-create [conn org-slug board-access]
   (api-common/open-company-authenticated-resource config/passphrase) ; verify validity and presence of required JWToken
 
   :allowed-methods [:options :post]
@@ -379,13 +400,15 @@
   ;; Authorization
   :allowed? (by-method {
     :options true
-    :post (fn [ctx] (access/allow-members conn org-slug (:user ctx)))})
+    :post (fn [ctx] (if (= board-access :team)
+                      (access/allow-members conn org-slug (:user ctx))
+                      (access/allow-premium conn org-slug (:user ctx))))})
 
   ;; Validations
   :processable? (by-method {
     :options true
     :post (fn [ctx] (and (slugify/valid-slug? org-slug)
-                         (valid-new-board? conn org-slug ctx)))})
+                         (valid-new-board? conn org-slug board-access ctx)))})
   :conflict? (fn [ctx] (let [data (:data ctx)
                              new-slug (-> ctx :new-board :slug) ; proposed new slug
                              ;; some new slugs can be excluded from being checked during a pre-flight check only
@@ -394,12 +417,10 @@
                              excluded? (when exclude-slugs (exclude-slugs new-slug))] ; excluded slugs don't need checked
                         (not (or excluded?
                                  (board-res/slug-available? conn (org-res/uuid-for conn org-slug) new-slug)))))
-
   ;; Actions
   :post! (fn [ctx] (if (-> ctx :data :pre-flight)
-                        true ; we were just checking if this would work
-                        (create-board conn ctx org-slug)))
-
+                     true ; we were just checking if this would work
+                     (create-board conn ctx org-slug)))
   ;; Responses
   :handle-created (fn [ctx] (let [pre-flight? (-> ctx :data :pre-flight)
                                   org (:existing-org ctx)
@@ -407,10 +428,9 @@
                                   board-slug (:slug new-board)]
                               (if pre-flight?
                                 (api-common/blank-response)
-                                (api-common/location-response
-                                  (board-url/url org-slug board-slug)
-                                  (board-rep/render-board org new-board ctx (default-board-params))
-                                  mt/board-media-type))))
+                                (api-common/location-response (board-urls/board org-slug board-slug)
+                                                              (board-rep/render-board org new-board ctx (default-board-params))
+                                                              mt/board-media-type))))
   :handle-unprocessable-entity (fn [ctx]
     (api-common/unprocessable-entity-response (:reason ctx))))
 
@@ -454,9 +474,9 @@
                         {:existing-org (api-common/rep org) :existing-board (api-common/rep board)
                          :existing? ((set (member-type board)) user-id)}
                         false))
-    :delete (fn [ctx] (if-let* [org (and (slugify/valid-slug? org-slug) (org-res/get-org conn org-slug))
-                                board (and (slugify/valid-slug? slug) (board-res/get-board conn (:uuid org) slug))
-                                exists? ((set (member-type board)) user-id)] ; short circuits the delete w/ a 404
+    :delete (fn [_] (if-let* [org (and (slugify/valid-slug? org-slug) (org-res/get-org conn org-slug))
+                              board (and (slugify/valid-slug? slug) (board-res/get-board conn (:uuid org) slug))
+                              _exists? ((set (member-type board)) user-id)] ; short circuits the delete w/ a 404
                         {:existing-org (api-common/rep org) :existing-board (api-common/rep board) :existing? true}
                         false))}) ; org or author doesn't exist
 
@@ -480,22 +500,25 @@
   (let [db-pool (-> sys :db-pool :pool)]
     (compojure/routes
       ;; Board operations
-      (ANY "/orgs/:org-slug/boards/:slug" [org-slug slug] (pool/with-pool [conn db-pool] (board conn org-slug slug)))
-      (ANY "/orgs/:org-slug/boards/:slug/" [org-slug slug] (pool/with-pool [conn db-pool] (board conn org-slug slug)))
-      ;; Board creation
-      (OPTIONS "/orgs/:org-slug/boards/" [org-slug] (pool/with-pool [conn db-pool] (board-list conn org-slug)))
-      (POST "/orgs/:org-slug/boards/" [org-slug] (pool/with-pool [conn db-pool] (board-list conn org-slug)))
+     (ANY (board-urls/board ":org-slug" ":slug") [org-slug slug] (pool/with-pool [conn db-pool] (board conn org-slug slug)))
+     (ANY (board-urls/board ":org-slug" ":slug") [org-slug slug] (pool/with-pool [conn db-pool] (board conn org-slug slug)))
+     ;; Public/Private board creation
+     (OPTIONS (board-urls/create ":org-slug" ":board-access") [org-slug board-access] (pool/with-pool [conn db-pool] (board-create conn org-slug (keyword board-access))))
+     (POST (board-urls/create ":org-slug" ":board-access") [org-slug board-access] (pool/with-pool [conn db-pool] (board-create conn org-slug (keyword board-access))))
+     ;; Board creation preflight check
+     (OPTIONS (board-urls/create-preflight ":org-slug") [org-slug] (pool/with-pool [conn db-pool] (board-create conn org-slug :team)))
+     (POST (board-urls/create-preflight ":org-slug") [org-slug] (pool/with-pool [conn db-pool] (board-create conn org-slug :team)))
       ;; Board author operations
-      (ANY "/orgs/:org-slug/boards/:slug/authors" [org-slug slug]
-        (pool/with-pool [conn db-pool] (member conn org-slug slug :authors nil)))
-      (ANY "/orgs/:org-slug/boards/:slug/authors/" [org-slug slug]
-        (pool/with-pool [conn db-pool] (member conn org-slug slug :authors nil)))
-      (ANY "/orgs/:org-slug/boards/:slug/authors/:user-id" [org-slug slug user-id]
-        (pool/with-pool [conn db-pool] (member conn org-slug slug :authors user-id)))
+     (ANY (board-urls/author ":org-slug" ":slug") [org-slug slug]
+       (pool/with-pool [conn db-pool] (member conn org-slug slug :authors nil)))
+     (ANY (str (board-urls/author ":org-slug" ":slug") "/") [org-slug slug]
+       (pool/with-pool [conn db-pool] (member conn org-slug slug :authors nil)))
+     (ANY (board-urls/author ":org-slug" ":slug" ":user-id") [org-slug slug user-id]
+       (pool/with-pool [conn db-pool] (member conn org-slug slug :authors user-id)))
       ;; Board viewer operations
-      (ANY "/orgs/:org-slug/boards/:slug/viewers" [org-slug slug]
-        (pool/with-pool [conn db-pool] (member conn org-slug slug :viewers nil)))
-      (ANY "/orgs/:org-slug/boards/:slug/viewers/" [org-slug slug]
-        (pool/with-pool [conn db-pool] (member conn org-slug slug :viewers nil)))
-      (ANY "/orgs/:org-slug/boards/:slug/viewers/:user-id" [org-slug slug user-id]
-        (pool/with-pool [conn db-pool] (member conn org-slug slug :viewers user-id))))))
+     (ANY (board-urls/viewer ":org-slug" ":slug") [org-slug slug]
+       (pool/with-pool [conn db-pool] (member conn org-slug slug :viewers nil)))
+     (ANY (str (board-urls/viewer ":org-slug" ":slug") "/") [org-slug slug]
+       (pool/with-pool [conn db-pool] (member conn org-slug slug :viewers nil)))
+     (ANY (board-urls/viewer ":org-slug" ":slug" ":user-id") [org-slug slug user-id]
+       (pool/with-pool [conn db-pool] (member conn org-slug slug :viewers user-id))))))

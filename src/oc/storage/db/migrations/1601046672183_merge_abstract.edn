@@ -1,0 +1,23 @@
+(ns oc.storage.db.migrations.merge-abstract
+  (:require [rethinkdb.query :as r]
+            [oc.lib.db.migrations :as m]
+            [oc.storage.resources.entry :as entry-res]
+            [oc.storage.config :as config]))
+
+(defn up [conn]
+  ;; Do great things
+  (println "Merge abstract text in the body as the first paragraph.")
+  (println (-> (r/table entry-res/table-name)
+               (r/filter (r/fn [entry]
+                          (r/and (r/ne (r/default (r/get-field entry [:abstract]) "")
+                                       "")
+                                 (r/not (r/default (r/get-field entry :abstract-merged) false)))))
+               (r/update (r/fn [entry]
+                          {:body (r/add "<p>"
+                                        (r/get-field entry :abstract)
+                                        "</p>"
+                                        (r/get-field entry :body))
+                           :abstract-merged true}))
+               (r/run conn)))
+
+  true) ; return true on success

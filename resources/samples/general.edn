@@ -2,23 +2,45 @@
   {
     :time-offset 15 ; 15 minutes ago
     :board-slug "general"
-    :headline "Welcome to Carrot 👋"
-    :abstract "Carrot provides a calm space for remote teams to stay informed and engaged. Getting started is easy. Post something to try it out."
-    :body "<p>Here are some common ways teams use Carrot:</p><ul><li>Announcements</li><li>Weekly reviews</li><li>HR and new hires</li><li>Decisions</li><li>CEO updates</li><li>Team updates</li><li>Product releases</li><li>Key metrics and results</li><li>Events</li></ul><p>To ensure key information is seen, everyone receives a personalized digest each morning that makes it easy for them to stay caught up on what matters. And when you share something in Carrot you'll always know who saw it. If it's missed, Carrot works in the background to remind your team for you.</p><p>Using Slack? Turn on our <a onclick=\"OCWebStaticOpenIntegrationsPanel(event);return false;\" target=\"_blank\" rel=\"noopener noreferrer\" style=\"background-color: rgb(251, 250, 249);\">Slack integration</a> to send Carrot posts into specific Slack channels.</p><p>Questions, ideas, or just feeling talkative? <a onclick=\"window.Intercom('showNewMessage');return false;\" target=\"_blank\" rel=\"noopener noreferrer\" style=\"background-color: rgb(251, 250, 249);\">Chat with us!</a> In the meantime, create a test post and invite your team with email or Slack.</p>"
+    :headline "Using Carrot to stay connected without the noise 🙌"
+    :body"
+      <p>Finally, a better way to know what's happening without constant back-and-forth interruptions. Carrot gives each of you a personalized news feed to focus on what matters to you.</p>
+
+      <p>Here are some common ways we'll use Carrot:</p>
+
+      <ul>
+        <li>Team updates</li>
+        <li>CEO updates</li>
+        <li>Announcements</li>
+        <li>Weekly reviews</li>
+        <li>HR and new hires</li>
+        <li>Decisions</li>
+        <li>Product releases</li>
+        <li>Key metrics and results</li>
+        <li>Events</li>
+        <li>News</li>
+      </ul>
+
+      <p>Carrot is ideal for asynchronous updates that don't require immediate attention from your teammates.</p>
+
+      <p>Plus, you can set up a digest to receive a batch of team updates on your preferred schedule. 😍</p>
+
+      <p>It's easy to get started! Give it a try by adding an update or some news to share with everyone. And be sure to <a href=\"javascript:oc.web.actions.nav_sidebar.open_invite_picker()\">invite your teammates to join you.</p>
+"
     :author {:name "Yellow Jelly Head" :avatar-url "/img/ML/happy_face_yellow.svg" :user-id "9999-9999-9999"}
     :comments [
       {:time-offset 10 ; 10 minutes ago
-       :body "This looks great! How do we make sure everyone knows about these posts?"
+       :body "This looks great! These updates were getting lost in all the chatter on Slack and Teams."
        :author {:name "Red Jelly Head" :avatar-url "/img/ML/happy_face_red.svg" :user-id "9999-9999-9998"}}
       {:time-offset 5 ; 5 minutes ago
-       :body "Easy, just head over to team management in settings and invite people by email or Slack. Once invited, they’ll receive a daily digest with new Carrot posts."
+       :body "True, it’s nice that every update is it’s own thread so it’s less noisy. I also love the digest. I set it up to get updates twice a day, but you can choose your own schedule. It’s much easier to stay focused now."
        :author {:name "Green Jelly Head" :avatar-url "/img/ML/happy_face_green.svg" :user-id "9999-9999-9997"}}]
     :reactions [
       {:time-offset 10 ; 10 minutes ago
-       :reaction "🙏"
+       :reaction "👍"
        :author {:name "Red Jelly Head" :avatar-url "/img/ML/happy_face_red.svg" :user-id "9999-9999-9998"}}
       {:time-offset 10 ; 10 minutes ago
-       :reaction "🥳"
+       :reaction "👍"
        :author {:name "Red Jelly Head" :avatar-url "/img/ML/happy_face_red.svg" :user-id "9999-9999-9998"}}]
   }
 ]

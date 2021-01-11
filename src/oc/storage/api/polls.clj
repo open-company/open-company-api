@@ -14,6 +14,7 @@
             [oc.storage.representations.media-types :as mt]
             [oc.storage.representations.entry :as entry-rep]
             [oc.storage.resources.org :as org-res]
+            [oc.storage.urls.entry :as entry-urls]
             [oc.storage.resources.board :as board-res]
             [oc.storage.resources.entry :as entry-res]
             [oc.storage.resources.reaction :as reaction-res]))
@@ -135,7 +136,7 @@
                      (:updated-entry ctx)
                      (:existing-comments ctx)
                      (reaction-res/aggregate-reactions (:existing-reactions ctx))
-                     (:access-level ctx)
+                     (select-keys ctx [:access-level :role])
                      (-> ctx :user :user-id)))})
   :handle-unprocessable-entity (fn [ctx]
     (api-common/unprocessable-entity-response (:reason ctx))))
@@ -187,7 +188,7 @@
                        (:updated-entry ctx)
                        (:existing-comments ctx)
                        (reaction-res/aggregate-reactions (:existing-reactions ctx))
-                       (:access-level ctx)
+                       (select-keys ctx [:access-level :role])
                        (-> ctx :user :user-id)))})
   :handle-unprocessable-entity (fn [ctx]
     (api-common/unprocessable-entity-response (:reason ctx))))
@@ -245,7 +246,7 @@
                      (:updated-entry ctx)
                      (:existing-comments ctx)
                      (reaction-res/aggregate-reactions (:existing-reactions ctx))
-                     (:access-level ctx)
+                     (select-keys ctx [:access-level :role])
                      (-> ctx :user :user-id)))
     :delete (fn [ctx] (entry-rep/render-entry
                        (:existing-org ctx)
@@ -253,7 +254,7 @@
                        (:updated-entry ctx)
                        (:existing-comments ctx)
                        (reaction-res/aggregate-reactions (:existing-reactions ctx))
-                       (:access-level ctx)
+                       (select-keys ctx [:access-level :role])
                        (-> ctx :user :user-id)))})
   :handle-unprocessable-entity (fn [ctx]
     (api-common/unprocessable-entity-response (:reason ctx))))
@@ -263,31 +264,34 @@
 (defn routes [sys]
   (let [db-pool (-> sys :db-pool :pool)]
     (compojure/routes
-      (OPTIONS "/orgs/:org-slug/boards/:board-slug/entries/:entry-uuid/polls/:poll-uuid/replies"
-        [org-slug board-slug entry-uuid poll-uuid]
-        (pool/with-pool [conn db-pool]
-          (poll-replies conn org-slug board-slug entry-uuid poll-uuid)))
-      (POST "/orgs/:org-slug/boards/:board-slug/entries/:entry-uuid/polls/:poll-uuid/replies"
-        [org-slug board-slug entry-uuid poll-uuid]
-        (pool/with-pool [conn db-pool]
-          (poll-replies conn org-slug board-slug entry-uuid poll-uuid)))
-      (OPTIONS "/orgs/:org-slug/boards/:board-slug/entries/:entry-uuid/polls/:poll-uuid/replies/:reply-id"
-        [org-slug board-slug entry-uuid poll-uuid reply-id]
-        (pool/with-pool [conn db-pool]
-          (poll-reply conn org-slug board-slug entry-uuid poll-uuid reply-id)))
-      (DELETE "/orgs/:org-slug/boards/:board-slug/entries/:entry-uuid/polls/:poll-uuid/replies/:reply-id"
-        [org-slug board-slug entry-uuid poll-uuid reply-id]
-        (pool/with-pool [conn db-pool]
-          (poll-reply conn org-slug board-slug entry-uuid poll-uuid reply-id)))
-      (OPTIONS "/orgs/:org-slug/boards/:board-slug/entries/:entry-uuid/polls/:poll-uuid/replies/:reply-id/vote"
-        [org-slug board-slug entry-uuid poll-uuid reply-id]
-        (pool/with-pool [conn db-pool]
-          (poll-vote conn org-slug board-slug entry-uuid poll-uuid reply-id)))
-      (POST "/orgs/:org-slug/boards/:board-slug/entries/:entry-uuid/polls/:poll-uuid/replies/:reply-id/vote"
-        [org-slug board-slug entry-uuid poll-uuid reply-id]
-        (pool/with-pool [conn db-pool]
-          (poll-vote conn org-slug board-slug entry-uuid poll-uuid reply-id)))
-      (DELETE "/orgs/:org-slug/boards/:board-slug/entries/:entry-uuid/polls/:poll-uuid/replies/:reply-id/vote"
-        [org-slug board-slug entry-uuid poll-uuid reply-id]
-        (pool/with-pool [conn db-pool]
-          (poll-vote conn org-slug board-slug entry-uuid poll-uuid reply-id))))))
+     ;; Replies
+     (OPTIONS (entry-urls/poll-replies ":org-slug" ":board-slug" ":entry-uuid" ":poll-uuid")
+       [org-slug board-slug entry-uuid poll-uuid]
+       (pool/with-pool [conn db-pool]
+         (poll-replies conn org-slug board-slug entry-uuid poll-uuid)))
+     (POST (entry-urls/poll-replies ":org-slug" ":board-slug" ":entry-uuid" ":poll-uuid")
+       [org-slug board-slug entry-uuid poll-uuid]
+       (pool/with-pool [conn db-pool]
+         (poll-replies conn org-slug board-slug entry-uuid poll-uuid)))
+      ;; Reply
+     (OPTIONS (entry-urls/poll-reply ":org-slug" ":board-slug" ":entry-uuid" ":poll-uuid" ":reply-id")
+       [org-slug board-slug entry-uuid poll-uuid reply-id]
+       (pool/with-pool [conn db-pool]
+         (poll-reply conn org-slug board-slug entry-uuid poll-uuid reply-id)))
+     (DELETE (entry-urls/poll-reply ":org-slug" ":board-slug" ":entry-uuid" ":poll-uuid" ":reply-id")
+       [org-slug board-slug entry-uuid poll-uuid reply-id]
+       (pool/with-pool [conn db-pool]
+         (poll-reply conn org-slug board-slug entry-uuid poll-uuid reply-id)))
+     ;; Vote
+     (OPTIONS (entry-urls/poll-reply-vote ":org-slug" ":board-slug" ":entry-uuid" ":poll-uuid" ":reply-id")
+       [org-slug board-slug entry-uuid poll-uuid reply-id]
+       (pool/with-pool [conn db-pool]
+         (poll-vote conn org-slug board-slug entry-uuid poll-uuid reply-id)))
+     (POST (entry-urls/poll-reply-vote ":org-slug" ":board-slug" ":entry-uuid" ":poll-uuid" ":reply-id")
+       [org-slug board-slug entry-uuid poll-uuid reply-id]
+       (pool/with-pool [conn db-pool]
+         (poll-vote conn org-slug board-slug entry-uuid poll-uuid reply-id)))
+     (DELETE (entry-urls/poll-reply-vote ":org-slug" ":board-slug" ":entry-uuid" ":poll-uuid" ":reply-id")
+       [org-slug board-slug entry-uuid poll-uuid reply-id]
+       (pool/with-pool [conn db-pool]
+         (poll-vote conn org-slug board-slug entry-uuid poll-uuid reply-id))))))
