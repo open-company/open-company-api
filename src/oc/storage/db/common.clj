@@ -280,6 +280,46 @@
       (db-common/read-resource conn table-name entry-uuid)
       (throw (RuntimeException. (str "RethinkDB update failure: " update))))))
 
+(defn create-version [conn versions-table-name updated-entry author]
+  (let [version (atom nil)
+        insert (db-common/with-timeout db-common/default-timeout
+                (-> (r/table versions-table-name)
+                 (r/insert
+                  (r/merge updated-entry
+                   (let [rev-id (as-> (r/table versions-table-name) q
+                                 (r/get-all q [(:uuid updated-entry)] {:index :uuid})
+                                 (r/max q :revision-id)
+                                 (r/get-field q :revision-id)
+                                 (r/default q -1)
+                                 (r/add q 1)
+                                 (r/run q conn))
+                         versioned-uuid (str (:uuid updated-entry) "-v" rev-id)
+                         ts (db-common/current-timestamp)]
+                     (reset! version versioned-uuid)
+                     {:revision-id rev-id
+                      :version-uuid versioned-uuid
+                      :revision-date ts
+                      :revision-author author})))
+                 (r/run conn)))]
+    (if (and @version
+             (= 1 (:inserted insert)))
+      (db-common/read-resource conn versions-table-name @version)
+      (throw (RuntimeException. (str "RethinkDB insert failure: " insert))))))
+
+(defn delete-versions
+  ([conn versions-table-name entry-uuid]
+   (delete-versions conn versions-table-name entry-uuid {:force-delete-all? false}))
+  ([conn versions-table-name entry-uuid
+    {force-delete-all? :force-delete-all? ;; By default or if not specified, it deletes only the drafts records
+     :as options}]
+   (db-common/with-timeout db-common/default-timeout
+    (-> (r/table versions-table-name)
+     (r/get-all [entry-uuid] {:index :uuid})
+     (r/filter (r/fn [v]
+      (r/eq (r/get-field v :status) :draft)))
+     (r/delete)
+     (r/run conn)))))
+
 (defn read-paginated-entries-for-replies
   "Read all entries with at least one comment the user has access to. Filter out those not activily followed
    by the current user. Sort those with unseen content at the top and sort everything by last activity descendant."

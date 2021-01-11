@@ -1,0 +1,11 @@
+(ns oc.storage.db.migrations.versions-entry-uuid-index
+  (:require [rethinkdb.query :as r]
+            [oc.lib.db.migrations :as m]
+            [oc.storage.config :as config]
+            [oc.storage.resources.entry :as entry]))
+
+(defn up [conn]
+  ;; Do great things
+  (println (m/create-index conn entry/versions-table-name "uuid"))
+
+  true) ; return true on success

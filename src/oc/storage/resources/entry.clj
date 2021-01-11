@@ -118,53 +118,19 @@
 
 (declare update-entry)
 
-(defn- create-version [conn updated-entry original-entry]
-  (let [ts (db-common/current-timestamp)
-        revision-id (:revision-id original-entry)
-        revision-id-new (inc revision-id)
-        revision (-> original-entry
-                     (assoc :version-uuid (str (:uuid original-entry)
-                                               "-v" revision-id))
-                     (assoc :revision-date ts)
-                     (assoc :revision-author (first (:author original-entry))))
-        updated-entry (if-not (:deleted original-entry)
-                        (update-entry conn
-                                      (assoc updated-entry :revision-id revision-id-new)
-                                      updated-entry
-                                      ts)
-                        updated-entry)]
-    (db-common/create-resource conn versions-table-name revision ts)
-    updated-entry))
+(defn- create-version [conn entry & [author]]
+  (storage-db-common/create-version conn versions-table-name entry (or author (first (:author entry)))))
 
-(defn- remove-version [conn entry version]
+(defn- delete-version [conn entry version]
   (let [version-uuid (str (:uuid entry) "-v" version)]
     (try
-      (when (db-common/read-resource conn versions-table-name version-uuid)
-        (db-common/delete-resource conn versions-table-name version-uuid))
-      (catch Exception e (timbre/error e)))))
+      (db-common/delete-resource conn versions-table-name version-uuid)
+      (catch Exception e
+       (timbre/error e)
+       false))))
 
 (defn delete-versions [conn entry-data]
-  (let [entry (if (:delete-entry entry-data)
-                ;; increment one to remove all versions when deleting a draft
-                (update-in entry-data [:revision-id] inc)
-                entry-data)]
-    (if (and (= 1 (:revision-id entry))
-             (:delete-entry entry))
-      (remove-version conn entry 1) ;; single entry with deleted draft
-      (when (pos? (:revision-id entry))
-        (doseq [version (range (:revision-id entry))]
-          (remove-version conn entry version))))))
-
-(declare get-entry)
-
-(defn- delete-version [conn uuid]
-  (let [entry (get-entry conn uuid)
-        revision-id (if (zero? (:revision-id entry))
-                      (inc (:revision-id entry))
-                      (:revision-id entry))]
-    (create-version conn entry (-> entry
-                                   (assoc :revision-id revision-id)
-                                   (assoc :deleted true)))))
+  (storage-db-common/delete-versions conn versions-table-name (:uuid entry-data)))
 
 ;; Sample content handling
 
@@ -291,9 +257,10 @@
   (when-let [original-entry (get-entry conn uuid)]
     (let [ts (db-common/current-timestamp)
           authors-entry (add-author-to-entry original-entry entry user)
-          updated-entry (update-entry conn authors-entry original-entry ts)]
-        ;; copy current version to versions table, increment revision uuid
-        (create-version conn updated-entry original-entry))))
+          updated-entry (update-entry conn authors-entry original-entry ts)
+          _revisioned-entry (create-version conn original-entry (lib-schema/author-for-user user))]
+      ;; copy current version to versions table, increment revision uuid
+      updated-entry)))
 
 (defn upsert-entry!
   "
@@ -331,7 +298,7 @@
       (schema/validate common/Entry entry-update)
       (let [updated-entry (db-common/update-resource conn table-name primary-key original-entry entry-update ts)
             ;; copy current version to versions table, increment revision uuid
-            versioned-entry (create-version conn updated-entry entry-update)]
+            versioned-entry (create-version conn original-entry publisher)]
         ;; Delete the draft entry's interactions
         (db-common/delete-resource conn common/interaction-table-name :resource-uuid uuid)
         versioned-entry)))))
@@ -340,10 +307,11 @@
   "Given the UUID of the entry, delete the entry and all its interactions. Return `true` on success."
   [conn uuid :- lib-schema/UniqueID]
   {:pre [(db-common/conn? conn)]}
-  (db-common/delete-resource conn common/interaction-table-name :resource-uuid uuid)
-  ;; update versions table as deleted (logical delete)
-  (delete-version conn uuid)
-  (db-common/delete-resource conn table-name uuid))
+  (let [original-entry (get-entry conn uuid)]
+    (db-common/delete-resource conn common/interaction-table-name :resource-uuid uuid)
+    ;; update versions table as deleted (logical delete)
+    (create-version conn (assoc original-entry :deleted true))
+    (db-common/delete-resource conn table-name uuid)))
 
 (schema/defn ^:always-validate revert-entry!
   "Given the UUID of the entry and revision, replace current revision with specified. Return `true` on success."

@@ -300,7 +300,7 @@
       (timbre/info "Created entry for:" entry-for "as" (:uuid entry-result))
       (when (= (keyword (:status entry-result)) :published)
         (undraft-board conn user org board)
-        (entry-res/delete-versions conn entry-result)
+        ; (entry-res/delete-versions conn entry-result)
         (auto-share-on-publish conn ctx entry-result))
       (notification/send-trigger! (notification/->trigger :add org board {:new entry-result} user nil))
       {:created-entry (api-common/rep entry-result)})
@@ -381,7 +381,7 @@
       (when old-board
         (let [remaining-entries (entry-res/list-all-entries-by-board conn (:uuid old-board))]
           (board-res/maybe-delete-draft-board conn org old-board remaining-entries user)))
-      (entry-res/delete-versions conn final-entry)
+      ; (entry-res/delete-versions conn final-entry)
       (auto-share-on-publish conn ctx final-entry)
       (timbre/info "Published entry:" entry-for)
       (notification/send-trigger! (notification/->trigger :add org board {:new final-entry} user nil))
@@ -399,8 +399,8 @@
       (when (= (keyword (:status entry)) :draft)
         (let [remaining-entries (entry-res/list-all-entries-by-board conn (:uuid board))]
           (board-res/maybe-delete-draft-board conn org board remaining-entries (:user ctx))))
-      (when (not= (keyword (:status entry)) :published)
-        (entry-res/delete-versions conn (assoc entry :delete-entry true)))
+      ; (when (not= (keyword (:status entry)) :published)
+      ;   (entry-res/delete-versions conn (assoc entry :delete-entry true)))
       (timbre/info "Deleted entry for:" entry-for)
       (notification/send-trigger! (notification/->trigger :delete org board {:old entry} (:user ctx) nil))
       true)
