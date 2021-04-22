@@ -183,8 +183,9 @@
         (assoc b :entries (remove nil?
                                   (map (fn [entry]
                                          (let [entry-board (if is-drafts-board? (boards-map (:board-uuid entry)) board)
-                                               board-access (when entry-board
-                                                              (assoc board-access :access-level (:access-level entry-board)))]
+                                               entry-board-access (if is-drafts-board?
+                                                                    (assoc board-access :access-level (:access-level entry-board))
+                                                                    board-access)]
                                            (when entry-board
                                              (render-entry-for-collection org entry-board entry board-access (-> ctx :user :user-id)))))
                                        (:entries board))))
