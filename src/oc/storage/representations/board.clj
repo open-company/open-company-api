@@ -155,10 +155,10 @@
   (let [{access-level :access-level :as board-access} (select-keys ctx [:access-level :role :premium?])
         viewer-or-author? (#{:author :viewer} access-level)
         is-drafts-board? (drafts-board? board)
-        rep-props (cond is-drafts-board?
-                        drafts-board-representation-props
-                        viewer-or-author?
+        rep-props (cond viewer-or-author?
                         representation-props
+                        is-drafts-board?
+                        drafts-board-representation-props
                         :else
                         public-representation-props)
         boards-map (:existing-org-boards ctx)
