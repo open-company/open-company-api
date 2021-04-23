@@ -343,14 +343,17 @@
                                            ;; Draft board for the user
                                            (board-res/drafts-board org-uuid (:user ctx))
                                            ;; Regular board by slug
-                                           (board-res/get-board conn org-uuid slug)))
-                               ;; For drafts board we need to return all the boards or users will be
-                               ;; cut out of their own drafts
-                               boards-by-uuid (activity-api/user-boards-by-uuid conn (:user ctx) org)]
-                        {:existing-org (api-common/rep org)
-                         :existing-board (api-common/rep board)
-                         :existing-org-boards (api-common/rep boards-by-uuid)}
-                        false))
+                                           (board-res/get-board conn org-uuid slug)))]
+                       (let [drafts-board? (board-rep/drafts-board? board)
+                             ;; Only for drafts board we need to return all the boards
+                             ;; or users will be cut out of their own drafts
+                             boards-by-uuid (when drafts-board?
+                                              (activity-api/user-boards-by-uuid conn (:user ctx) org))]
+                         {:existing-org (api-common/rep org)
+                          :existing-board (api-common/rep board)
+                          :drafts-board? drafts-board?
+                          :existing-org-boards (api-common/rep boards-by-uuid)})
+                         false))
 
   ;; Actions
   :patch! (fn [ctx] (update-board conn ctx org-slug slug))
@@ -360,7 +363,7 @@
   :handle-ok (fn [ctx] (let [ctx-params (-> ctx :request :params)
                              org (:existing-org ctx)
                              board (or (:updated-board ctx) (:existing-board ctx))
-                             drafts-board? (board-rep/drafts-board? board)
+                             drafts-board? (:drafts-board? ctx)
                              params (when-not drafts-board?
                                       (-> ctx-params
                                        (dissoc :org-slug)
