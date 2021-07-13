@@ -18,6 +18,7 @@
     :receiver {
       :type (schema/enum :all-members :user :channel)
       :slack-org-id lib-schema/NonBlankStr
+      (schema/optional-key :needs-join) (schema/maybe schema/Bool)
       (schema/optional-key :id) schema/Str
   }})
 
@@ -70,6 +71,7 @@
   (let [slack-org-id (-> share-request :channel :slack-org-id)
         channel-type (or (-> share-request :channel :type keyword)
                          :channel)
+        needs-join (-> share-request :channel :needs-join)
         comments (:existing-comments entry)
         comment-count (str (count comments))]
     {
@@ -77,6 +79,7 @@
       :receiver {
         :type channel-type
         :slack-org-id slack-org-id
+        :needs-join needs-join
         :id (-> share-request :channel :channel-id)
       }
       :bot (bot-for slack-org-id user)
@@ -102,9 +105,8 @@
     }))
 
 (defn- send-trigger! [trigger]
-  (timbre/info "Bot request to queue:" config/aws-sqs-bot-queue)
   (timbre/trace "Bot request:" (dissoc trigger :entries))
-  (timbre/info "Sending request to:" config/aws-sqs-bot-queue)
+  (timbre/debug "Sending request to:" config/aws-sqs-bot-queue)
   (sqs/send-message
    {:access-key config/aws-access-key-id
     :secret-key config/aws-secret-access-key}

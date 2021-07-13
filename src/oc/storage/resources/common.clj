@@ -61,6 +61,9 @@
    :access AccessLevel
    schema/Keyword schema/Any})
 
+(def SlackMirror
+  (schema/if map? lib-schema/SlackChannel [lib-schema/SlackChannel]))
+
 (def Board
   "An container of entries."
   {
@@ -72,7 +75,7 @@
   :access AccessLevel
   :authors [lib-schema/UniqueID]
   :viewers [lib-schema/UniqueID]
-  (schema/optional-key :slack-mirror) (schema/maybe lib-schema/SlackChannel)
+  (schema/optional-key :slack-mirror) (schema/maybe SlackMirror)
   :author lib-schema/Author
   (schema/optional-key :draft) schema/Bool
   :created-at lib-schema/ISO8601

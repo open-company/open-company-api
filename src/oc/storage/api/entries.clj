@@ -109,12 +109,18 @@
             entry (or (:existing-entry ctx)
                       (entry-res/get-entry-by-secure-uuid conn org-uuid secure-uuid))
             board (board-res/get-board conn (:board-uuid entry))
+            comments (or (:existing-comments ctx)
+                         (entry-res/list-comments-for-entry conn (:uuid entry)))
+            reactions (or (:existing-reactions ctx)
+                          (entry-res/list-reactions-for-entry conn (:uuid entry)))
             _matches? (= org-uuid (:org-uuid board)) ; sanity check
             access-level (or (access/access-level-for org board user) {:access-level :public})]
     (merge access-level
            {:existing-org (api-common/rep org)
             :existing-board (api-common/rep board)
-            :existing-entry (api-common/rep entry)})
+            :existing-entry (api-common/rep entry)
+            :existing-comments (api-common/rep comments)
+            :existing-reactions (api-common/rep reactions)})
     false))
 
 (defn label-exists? [conn ctx org-slug board-slug entry-uuid label-uuid user]
@@ -392,17 +398,22 @@
 
 (defn auto-share-on-publish
   [conn ctx entry-result]
-  (if-let* [slack-channel (:slack-mirror (:existing-board ctx))
-            _can-slack-share (bot/has-slack-bot-for? (:slack-org-id slack-channel) (:user ctx))]
-    (let [share-request {:medium "slack"
-                         :note ""
-                         :shared-at (db-common/current-timestamp)
-                         :channel slack-channel}
-          share-ctx (-> ctx
-                        (assoc :share-requests (list share-request))
-                        (assoc :existing-entry (api-common/rep entry-result))
-                        (assoc :auto-share true))]
-      (share-entry conn share-ctx (:uuid entry-result)))))
+  (timbre/infof "Auto sharing entry %s" (:uuid entry-result))
+  (let [slack-channels* (:slack-mirror (:existing-board ctx))
+        slack-channels (if (map? slack-channels*) [slack-channels*] slack-channels*)]
+    (doseq [slack-channel slack-channels]
+      (timbre/debugf "Sharing to %s/%s" (:slack-org-id slack-channel) (:channel-id slack-channel))
+      (if (bot/has-slack-bot-for? (:slack-org-id slack-channel) (:user ctx))
+        (let [share-request {:medium "slack"
+                             :note ""
+                             :shared-at (db-common/current-timestamp)
+                             :channel slack-channel}
+              share-ctx (-> ctx
+                            (assoc :share-requests (list share-request))
+                            (assoc :existing-entry (api-common/rep entry-result))
+                            (assoc :auto-share true))]
+          (share-entry conn share-ctx (:uuid entry-result)))
+        (timbre/infof "")))))
 
 (defn undraft-board [conn _user _org board]
   (when (:draft board)
